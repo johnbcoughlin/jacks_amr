@@ -135,6 +135,7 @@ class AMRGridFactory():
         one_to_ndim = tuple(range(self.n_dims))
         print(one_to_ndim)
 
+        # Refine a single L0 block
         def refine_one(carry, L0_block_indices):
             L0_coords = jax.tree.map(
                     lambda idxs, coords, axis: jnp.take(coords, idxs, axis=axis),
@@ -142,13 +143,13 @@ class AMRGridFactory():
 
             # Find all L1 blocks that lie inside the current L0 block
             contained_L1_block_indices = jax.tree.map(
-                    lambda L0_idx, L1_block_size, dim: jnp.arange(
-                        L0_idx*2, (L0_idx+self.L0_shape[dim])*2, L1_block_size),
+                    lambda L0_idx, L1_block_size, dim: L0_idx*2 + jnp.arange(0, self.L0_shape[dim]*2, L1_block_size),
                     L0_block_indices, self.level_specs[1].block_shape, one_to_ndim)
             flattened_L1_block_indices = jax.tree.map(
                     lambda a: a.flatten(),
                     tuple(jnp.meshgrid(*contained_L1_block_indices, indexing='ij')))
 
+            # Evaluate the refinement criterion for the L1 block and activate it if necessary.
             def compare_one_block(carry_grid, L1_block_indices):
                 L1_coords = jax.tree.map(
                         lambda idx, L1_block_size, coords, axis: jnp.take(coords, idx + jnp.arange(L1_block_size), axis=axis),
@@ -170,7 +171,6 @@ class AMRGridFactory():
                                        pytree=carry_grid, 
                                        replace_fn=lambda level: level.with_block_active(block_indices))
 
-
                 carry_grid = jax.lax.cond(should_refine,
                                           with_block_active,
                                           lambda: carry_grid)
@@ -182,7 +182,9 @@ class AMRGridFactory():
 
             return carry, None
 
-        grid, _ = refine_one(grid, jax.tree.map(lambda a: a[0], grid.levels[0].block_indices))
+        grid, _ = jax.lax.scan(
+            refine_one, grid, grid.levels[0].block_indices)
+
         return grid
 
 
