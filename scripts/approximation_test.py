@@ -12,7 +12,7 @@ n_levels = 5
 L0_shape = (6, 6)
 
 level_specs = [amr.AMRLevelSpec(0, L0_shape, 1, (6, 6))] + [
-        amr.AMRLevelSpec(i, L0_shape, min(100, 9*(4**i)), (2, 2)) for i in range(1, 5)
+        amr.AMRLevelSpec(i, L0_shape, min(200, 9*(4**i)), (2, 2)) for i in range(1, 5)
 ]
 
 AMR = amr.AMRGridFactory(5, 1, (6, 6),
@@ -24,7 +24,7 @@ def f(x, y):
 
 
 def criterion(coarse, fine):
-    return jnp.logical_not(jnp.allclose(coarse, fine, rtol=1e-2, atol=1e-3))
+    return jnp.sqrt(jnp.sum(jnp.abs(coarse - fine)**2)) > 1e-3
 
 
 grid = AMR.approximate(f, criterion)
