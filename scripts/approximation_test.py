@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import jax
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+import timeit
 
 n_levels = 5
 
@@ -24,10 +25,13 @@ def f(x, y):
 
 
 def criterion(coarse, fine):
-    return jnp.sqrt(jnp.sum(jnp.abs(coarse - fine)**2)) > 1e-3
+    return jnp.sqrt(jnp.sum(jnp.abs(coarse - fine)**2))
 
 
-grid = AMR.approximate(f, criterion)
+grid = AMR.refine_to_approximate(f, criterion)
+
+elapsed = timeit.timeit(lambda: AMR.refine_to_approximate(f, criterion), number=10)
+print("elapsed:", elapsed)
 
 finest = f(*AMR.level_coordinates_center[-1])
 
@@ -49,8 +53,8 @@ for i, level in enumerate(grid.levels):
         block_indices = jax.tree.map(lambda a: a[j], level.block_indices)
         for k1 in range(spec.block_shape[0]):
             for k2 in range(spec.block_shape[1]):
-                s1 = block_indices[0] * spec.block_shape[0] + k1
-                s2 = block_indices[1] * spec.block_shape[1] + k2
+                s1 = block_indices[0] + k1
+                s2 = block_indices[1] + k2
                 rect = mpl.patches.Rectangle(
                         (coords[0].flatten()[s1], coords[1].flatten()[s2]), dx, dx,
                         linewidth=1,

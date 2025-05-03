@@ -3,6 +3,7 @@ import equinox as eqx
 import jax
 from jaxtyping import Array, Bool, PyTree, PyTreeDef
 import math
+from functools import partial
 
 
 class AMRLevelSpec():
@@ -125,78 +126,74 @@ class AMRGridFactory():
         return AMRGrid(levels)
 
 
-    def approximate(self, f, refinement_criterion):
-        '''
-        Approximates the function f on a grid
-        '''
+    @partial(jax.jit, static_argnums=(0, 1, 2))
+    def refine_to_approximate(self, f, refinement_criterion):
         grid = self.base_grid()
-        f0 = f(*self.level_coordinates_center[0])
-
         one_to_ndim = tuple(range(self.n_dims))
-        print(one_to_ndim)
 
         def refine_one_level(grid, level_idx):
             coarse = {
                 "center_coords": self.level_coordinates_center[level_idx],
+                "spec": self.level_specs[level_idx],
             }
             fine = {
                 "center_coords": self.level_coordinates_center[level_idx+1],
                 "spec": self.level_specs[level_idx+1],
             }
-
-            # Refine a single L0 block
-            def refine_one(carry, L0_block_indices):
-                L0_coords = jax.tree.map(
+            
+            def evaluate_criteria_in_coarse_block(coarse_block_indices):
+                coarse_coords = jax.tree.map(
                         lambda idxs, coords, axis: jnp.take(coords, idxs, axis=axis),
-                        L0_block_indices, coarse["center_coords"], one_to_ndim)
+                        coarse_block_indices, coarse["center_coords"], one_to_ndim)
 
-                # Find all L1 blocks that lie inside the current L0 block
-                contained_L1_block_indices = jax.tree.map(
-                        lambda L0_idx, fine_block_size, dim: L0_idx*2 + jnp.arange(0, self.L0_shape[dim]*2, fine_block_size),
-                        L0_block_indices, fine["spec"].block_shape, one_to_ndim)
-                flattened_L1_block_indices = jax.tree.map(
+                # Find all fine blocks that lie inside the current coarse block
+                contained_fine_block_indices = jax.tree.map(
+                        lambda coarse_idx, coarse_block_size, fine_block_size, dim: coarse_idx*2 + jnp.arange(0, coarse_block_size*2, fine_block_size),
+                        coarse_block_indices, coarse["spec"].block_shape, fine["spec"].block_shape, one_to_ndim)
+                flattened_fine_block_indices = jax.tree.map(
                         lambda a: a.flatten(),
-                        tuple(jnp.meshgrid(*contained_L1_block_indices, indexing='ij')))
+                        tuple(jnp.meshgrid(*contained_fine_block_indices, indexing='ij')))
 
-                # Evaluate the refinement criterion for the L1 block and activate it if necessary.
-                def compare_one_block(carry_grid, L1_block_indices):
-                    L1_coords = jax.tree.map(
+                # Evaluate the refinement criterion for the fine block and activate it if necessary.
+                def single_block_criterion(fine_block_indices):
+                    fine_coords = jax.tree.map(
                             lambda idx, fine_block_size, coords, axis: jnp.take(coords, idx + jnp.arange(fine_block_size), axis=axis),
-                            L1_block_indices, fine["spec"].block_shape, fine["center_coords"], one_to_ndim)
-                    comparable_L0_coords = jax.tree.map(
+                            fine_block_indices, fine["spec"].block_shape, fine["center_coords"], one_to_ndim)
+                    comparable_coarse_coords = jax.tree.map(
                             lambda idx, fine_block_size, coords, axis: jnp.take(coords, idx // 2 + jnp.arange(fine_block_size // 2), axis=axis),
-                            L1_block_indices, fine["spec"].block_shape, coarse["center_coords"], one_to_ndim)
+                            fine_block_indices, fine["spec"].block_shape, coarse["center_coords"], one_to_ndim)
 
-                    L1_values = f(*L1_coords)
-                    L0_values = jnp.tile(f(*comparable_L0_coords), [2]*self.n_dims)
+                    fine_values = f(*fine_coords)
+                    coarse_values = jnp.tile(f(*comparable_coarse_coords), [2]*self.n_dims)
 
-                    should_refine = refinement_criterion(L0_values, L1_values)
+                    return refinement_criterion(coarse_values, fine_values)
 
-                    def with_block_active():
-                        block_indices = jax.tree.map(
-                                lambda s: s // 2,
-                                L1_block_indices)
-                        return eqx.tree_at(where=lambda grid: grid.levels[level_idx+1],
-                                           pytree=carry_grid, 
-                                           replace_fn=lambda level: level.with_block_active(block_indices))
 
-                    carry_grid = jax.lax.cond(should_refine,
-                                              with_block_active,
-                                              lambda: carry_grid)
+                fine_block_criteria = jax.vmap(single_block_criterion)(flattened_fine_block_indices)
 
-                    return carry_grid, None
+                return fine_block_criteria, flattened_fine_block_indices
 
-                
-                carry, _ = jax.lax.scan(compare_one_block, carry, flattened_L1_block_indices)
+            fine_block_criteria, flattened_fine_block_indices = jax.vmap(evaluate_criteria_in_coarse_block)(grid.levels[level_idx].block_indices)
+            filtered_criteria = jnp.where(jnp.expand_dims(grid.levels[level_idx].block_indices[0] == -1, axis=1),
+                                          -jnp.inf,
+                                          fine_block_criteria)
+            sorted_idcs = jnp.argsort(filtered_criteria.flatten())
 
-                return carry, None
+            def with_block_active(carry_grid, fine_block_indices):
+                block_indices = jax.tree.map(
+                        lambda s: s,
+                        fine_block_indices)
+                carry_grid = eqx.tree_at(where=lambda grid: grid.levels[level_idx+1],
+                                   pytree=carry_grid, 
+                                   replace_fn=lambda level: level.with_block_active(block_indices))
+                return carry_grid, None
 
-            grid, _ = jax.lax.scan(
-                refine_one, grid, grid.levels[level_idx].block_indices)
+            K = 10 * (2**level_idx)
+            top_K_blocks = jax.tree.map(lambda a: a.flatten()[sorted_idcs[-K:]], flattened_fine_block_indices)
+            refined_grid, _ = jax.lax.scan(with_block_active, grid, top_K_blocks)
+            return refined_grid
 
-            return grid
-
-        for level_idx in range(self.n_levels-1):
+        for level_idx in range(4):
             grid = refine_one_level(grid, level_idx)
 
         return grid
