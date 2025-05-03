@@ -6,7 +6,12 @@ import math
 from functools import partial
 
 
-class AMRLevelSpec():
+class AMRLevelSpec(eqx.Module):
+    n_blocks: int
+    block_array_shape: PyTree
+    block_shape: PyTree
+    level_shape: PyTree
+
     def __init__(self, level, L0_shape, n_blocks, block_shape):
         level_shape = jax.tree.map(lambda s: s * (2**level), L0_shape)
 
@@ -123,7 +128,7 @@ class AMRGridFactory():
                 lambda arr: arr.at[:].set(0),
                 levels[0].block_indices)
         levels[0] = AMRLevel(block_index_map, 1, block_indices)
-        return AMRGrid(levels)
+        return AMRGrid(self.n_dims, levels, self.level_specs, self.level_coordinates_center)
 
 
     @partial(jax.jit, static_argnums=(0, 1, 2))
@@ -199,15 +204,57 @@ class AMRGridFactory():
         return grid
 
 
+
 class AMRGrid(eqx.Module):
+    n_dims: int = eqx.field(static=True)
     levels: list[AMRLevel]
+    level_specs: list[AMRLevelSpec] = eqx.field(static=True)
+    level_coordinates_center: list[PyTree]
 
-    def __init__(self, levels):
+    def __init__(self, n_dims, levels, level_specs, level_coordinates_center):
+        self.n_dims = n_dims
         self.levels = levels
+        self.level_specs = level_specs
+        self.level_coordinates_center = level_coordinates_center
 
 
-class AMRGridFunction():
-    def __init__(self, grid):
-        pass
+    @partial(jax.jit, static_argnums=(1,))
+    def approximate(self, f):
+        one_to_ndim = tuple(range(self.n_dims))
+
+        def approximate_single_level(level_idx):
+            level = self.levels[level_idx]
+            spec = self.level_specs[level_idx]
+            center_coords = self.level_coordinates_center[level_idx]
+
+            def approximate_single_block(block_indices):
+                coords = jax.tree.map(
+                        lambda idx, block_size, coords, axis: jnp.take(
+                            coords, idx + jnp.arange(block_size), axis=axis),
+                        block_indices, spec.block_shape, center_coords, one_to_ndim)
+                return f(*coords)
+
+            vmapped = jax.vmap(approximate_single_block)(level.block_indices)
+            mask = jnp.expand_dims(level.block_indices[0] == -1, axis=(1, 2))
+            print(level.block_indices[0].shape)
+            print(mask.shape)
+            filtered = jnp.where(mask, jnp.nan, vmapped)
+
+            return filtered
+
+        return AMRGridFunction(self, 
+                               [approximate_single_level(i) for i in range(len(self.levels))])
+
+
+
+
+
+class AMRGridFunction(eqx.Module):
+    grid: AMRGrid
+    level_values: list[jax.Array]
+
+    def __init__(self, grid, level_values):
+        self.grid = grid
+        self.level_values = level_values
 
 
