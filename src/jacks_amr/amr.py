@@ -21,6 +21,23 @@ class AMRLevelSpec(eqx.Module):
         self.level_shape = level_shape
 
 
+    def block_ghost_cell_relative_indices(self, dim, direction):
+        '''
+        Returns an array of indices of the request ghost cells, relative to the origin
+        of the requesting block.
+        '''
+        n_dims = len(self.block_shape)
+        if direction == 'left':
+            rel = jnp.array([-1])
+        elif direction == 'right':
+            rel = jnp.array([self.block_shape[dim]])
+
+        relative_indices = [jnp.arange(self.block_shape[i]) for i in range(n_dims)]
+        relative_indices[dim] = rel
+        return tuple(relative_indices)
+
+
+
 class AMRLevel(eqx.Module):
     n_active: int
     # A (K x M x N x ...) array whose entries are either -1, indicating an inactive block,
@@ -228,10 +245,12 @@ class AMRGrid(eqx.Module):
             center_coords = self.level_coordinates_center[level_idx]
 
             def approximate_single_block(block_indices):
+                block_origin = jax.tree.map(lambda block_size, idx: idx * block_size,
+                                            spec.block_shape, block_indices)
                 coords = jax.tree.map(
-                        lambda idx, block_size, coords, axis: jnp.take(
-                            coords, idx + jnp.arange(block_size), axis=axis),
-                        block_indices, spec.block_shape, center_coords, one_to_ndim)
+                        lambda origin, block_size, coords, axis: jnp.take(
+                            coords, origin + jnp.arange(block_size), axis=axis),
+                        block_origin, spec.block_shape, center_coords, one_to_ndim)
                 return f(*coords)
 
             vmapped = jax.vmap(approximate_single_block)(level.block_indices)
@@ -247,8 +266,6 @@ class AMRGrid(eqx.Module):
 
 
 
-
-
 class AMRGridFunction(eqx.Module):
     grid: AMRGrid
     level_values: list[jax.Array]
@@ -257,4 +274,51 @@ class AMRGridFunction(eqx.Module):
         self.grid = grid
         self.level_values = level_values
 
+
+    @partial(jax.jit, static_argnums=(1, 3, 4))
+    def ghost_cells(self, level_idx, block_origin, dim, direction):
+        '''
+        Returns the array of ghost cell values bordering the level-`level_idx` block 
+        with origin `block_origin`, in `direction` along `dim`.
+        '''
+        grid = self.grid
+        level_spec = grid.level_specs[level_idx]
+        ghost_cells_shape = [*level_spec.block_shape]
+        ghost_cells_shape[dim] = 1
+        result = jnp.zeros(ghost_cells_shape)
+
+        fine_ghost_cell_relative_indices = level_spec.block_ghost_cell_relative_indices(dim, direction)
+        fine_ghost_cell_indices = jax.tree.map(
+                lambda a, b: a + b, block_origin, fine_ghost_cell_relative_indices)
+        fine_ghost_cell_first_index = jax.tree.map(
+                lambda a: a.flatten()[0], fine_ghost_cell_indices)
+
+        for coarse_level_idx in range(level_idx):
+            decimate = lambda idx: idx // (2 ** (level_idx - coarse_level_idx))
+            coarse_level = grid.levels[coarse_level_idx]
+
+            # Find the coarse-level block that contains the requested cells
+            # Because the fine-level block is properly nested within the coarse level blocks
+            # at each level, we can simply find the coarse block that contains the first ghost cell
+            coarse_origin_of_fine_block = jax.tree.map(decimate, fine_ghost_cell_first_index)
+            coarse_block_idx = jax.tree.map(
+                    lambda s, b_s: s // b_s,
+                    coarse_origin_of_fine_block, grid.level_specs[coarse_level_idx].block_shape)
+            coarse_block_origin = jax.tree.map(
+                    lambda s, b_s: s * b_s,
+                    coarse_block_idx, grid.level_specs[coarse_level_idx].block_shape)
+
+            # Calculate the position in the coarse block of the requested cells
+            coarse_ghost_cell_indices = jax.tree.map(decimate, fine_ghost_cell_indices)
+            coarse_block_ghost_cell_offsets = jax.tree.map(
+                    lambda a, b: a - b, coarse_ghost_cell_indices, coarse_block_origin)
+
+            coarse_block_active_idx = coarse_level.block_index_map[coarse_block_idx]
+            coarse_values = self.level_values[coarse_level_idx][coarse_block_active_idx, ...]
+            coarse_ghost_cells = coarse_values[coarse_block_ghost_cell_offsets]
+            result = jax.lax.cond(coarse_block_active_idx == -1,
+                                  lambda: result,
+                                  lambda: jnp.reshape(coarse_ghost_cells, result.shape))
+
+        return result
 
