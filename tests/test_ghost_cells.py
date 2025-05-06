@@ -3,6 +3,9 @@ sys.path.append("src")
 
 from jacks_amr import amr
 import jax.numpy as jnp
+import jax
+
+jax.config.update("jax_enable_x64", True)
 
 def construct_example_grid():
     n_levels = 4
@@ -64,3 +67,18 @@ def test_exterior_ghost_cells_dont_throw():
     
     ghost_cells = q.ghost_cells_interior(2, (0, 4), 0, 'left')
     ghost_cells = q.ghost_cells_interior(1, (0, 2), 1, 'right')
+
+
+def test_ghost_cells_boundary():
+    grid = construct_example_grid()
+    f = lambda x, y: jnp.tanh(-(jnp.sqrt(x**2 + y**2) - 0.7) / 0.1)
+    q = grid.approximate(f)
+
+    bc = lambda coords, copyout_values: -copyout_values
+    ghost_cells = q.ghost_cells_boundary(2, (0, 4), 0, 'left', bc)
+    print(ghost_cells)
+    print(f(jnp.array([1/16, 1/16]),
+                                        jnp.array([9/16, 11/16])))
+    assert jnp.allclose(ghost_cells, -f(jnp.array([1/16, 1/16]),
+                                        jnp.array([9/16, 11/16])))
+

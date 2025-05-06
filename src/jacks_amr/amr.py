@@ -37,6 +37,22 @@ class AMRLevelSpec(eqx.Module):
         return tuple(relative_indices)
 
 
+    def block_copyout_cell_relative_indices(self, dim, direction):
+        '''
+        Returns an array of indices of the request ghost cells, relative to the origin
+        of the requesting block.
+        '''
+        n_dims = len(self.block_shape)
+        if direction == 'left':
+            rel = jnp.array([0])
+        elif direction == 'right':
+            rel = jnp.array([self.block_shape[dim]-1])
+
+        relative_indices = [jnp.arange(self.block_shape[i]) for i in range(n_dims)]
+        relative_indices[dim] = rel
+        return tuple(relative_indices)
+
+
 
 class AMRLevel(eqx.Module):
     n_active: int
@@ -275,6 +291,19 @@ class AMRGridFunction(eqx.Module):
         self.level_values = level_values
 
 
+    def ghost_cells(self, level_idx, block_origin, dim, direction, boundary_condition):
+        block_indices = jax.tree.map(lambda s, shape: s // shape,
+                                     block_origin, self.grid.level_specs[level_idx].block_shape)
+        if direction == 'left':
+            return jax.lax.cond(block_indices[dim] == 0,
+                                lambda: self.ghost_cells_boundary(level_idx, block_origin, dim, direction, boundary_condition),
+                                lambda: self.ghost_cells_interior(level_idx, block_origin, dim, direction))
+        elif direction == 'right':
+            return jax.lax.cond(block_indices[dim] == grid.level_specs[level_idx].block_array_shape[dim],
+                                lambda: self.ghost_cells_boundary(level_idx, block_origin, dim, direction, boundary_condition),
+                                lambda: self.ghost_cells_interior(level_idx, block_origin, dim, direction))
+
+
     @partial(jax.jit, static_argnums=(1, 3, 4))
     def ghost_cells_interior(self, level_idx, block_origin, dim, direction):
         '''
@@ -321,4 +350,35 @@ class AMRGridFunction(eqx.Module):
                                   lambda: jnp.reshape(coarse_ghost_cells, result.shape))
 
         return result
+
+    def ghost_cells_boundary(self, level_idx, block_origin, dim, direction, boundary_condition):
+        grid = self.grid
+        level = grid.levels[level_idx]
+        level_spec = grid.level_specs[level_idx]
+        center_coords = grid.level_coordinates_center[level_idx]
+        ghost_cells_shape = [*level_spec.block_shape]
+        ghost_cells_shape[dim] = 1
+        result = jnp.zeros(ghost_cells_shape)
+
+        one_to_ndim = tuple(range(grid.n_dims))
+
+        block_indices = jax.tree.map(lambda s, b: s // b,
+                                     block_origin, level_spec.block_shape)
+        block_active_idx = level.block_index_map[block_indices]
+
+        fine_copyout_cell_relative_indices = level_spec.block_copyout_cell_relative_indices(dim, direction)
+        fine_copyout_cell_indices = jax.tree.map(
+                lambda a, b: a + b, block_origin, fine_copyout_cell_relative_indices)
+        jax.debug.print("{}", fine_copyout_cell_indices)
+        copyout_cell_values = self.level_values[level_idx][block_active_idx][fine_copyout_cell_relative_indices]
+        copyout_cell_values = jnp.reshape(copyout_cell_values,
+                                          jax.tree.map(lambda a: a.shape[0], fine_copyout_cell_relative_indices))
+        jax.debug.print("{}", copyout_cell_values)
+
+        coords = jax.tree.map(
+                lambda idx, coords, axis: jnp.take(coords, idx, axis=axis),
+                fine_copyout_cell_indices, center_coords, one_to_ndim)
+
+        return boundary_condition(coords, copyout_cell_values)
+        
 
