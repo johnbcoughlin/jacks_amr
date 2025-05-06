@@ -1,10 +1,12 @@
+from jax._src.numpy.lax_numpy import cross
 import jax.numpy as jnp
+from opt_einsum.paths import re
 import equinox as eqx
 import jax
 from jaxtyping import Array, Bool, PyTree, PyTreeDef
 import math
 from functools import partial
-
+from .arrays import coarsen_face_values_by_2, first_non_nan
 
 class AMRLevelSpec(eqx.Module):
     n_blocks: int
@@ -69,10 +71,10 @@ class AMRLevel(eqx.Module):
 
 
     def with_block_active(self, block_index):
-        return jax.lax.cond(self.block_index_map[block_index] >= 0, 
+        return jax.lax.cond(self.block_index_map[block_index] >= 0,
                             lambda: self,
                             lambda: AMRLevel(
-                                self.block_index_map.at[block_index].set(self.n_active), 
+                                self.block_index_map.at[block_index].set(self.n_active),
                                 self.n_active+1,
                                 jax.tree.map(lambda a, idx: a.at[self.n_active].set(idx),
                                              self.block_indices,
@@ -86,7 +88,7 @@ class AMRGridFactory():
     information about actual mesh refinements, it just defines the coarsest grid and
     the parameters for how the mesh is to be refined.
     '''
-    def __init__(self, 
+    def __init__(self,
                  n_levels, n_components, L0_shape, lower, upper,
                  level_specs):
         self.n_components = n_components
@@ -128,7 +130,7 @@ class AMRGridFactory():
                 'upper': jnp.linspace(l+dx, u, level_size),
             }
             return jax.tree.map(expand_dims, d)
-            
+
 
         self.level_coordinates_center = [jax.tree.map(
             lambda l, u, L0_dim, dim: make_coordinate_array(l, u, L0_dim, dim, i)['center'],
@@ -145,8 +147,8 @@ class AMRGridFactory():
         block_index_map = -1 * jnp.ones(spec.block_array_shape, int)
         block_indices = jax.tree.map(lambda dim: jnp.repeat(-1, spec.n_blocks),
                                      tuple(range(self.n_dims)))
-        return AMRLevel(block_index_map, 
-                        0, 
+        return AMRLevel(block_index_map,
+                        0,
                         block_indices)
 
 
@@ -178,7 +180,7 @@ class AMRGridFactory():
                 "center_coords": self.level_coordinates_center[level_idx+1],
                 "spec": self.level_specs[level_idx+1],
             }
-            
+
             def evaluate_criteria_in_coarse_block(coarse_block_indices):
                 coarse_coords = jax.tree.map(
                         lambda idxs, coords, axis: jnp.take(coords, idxs, axis=axis),
@@ -222,7 +224,7 @@ class AMRGridFactory():
                         lambda s: s,
                         fine_block_indices)
                 carry_grid = eqx.tree_at(where=lambda grid: grid.levels[level_idx+1],
-                                   pytree=carry_grid, 
+                                   pytree=carry_grid,
                                    replace_fn=lambda level: level.with_block_active(block_indices))
                 return carry_grid, None
 
@@ -271,13 +273,11 @@ class AMRGrid(eqx.Module):
 
             vmapped = jax.vmap(approximate_single_block)(level.block_indices)
             mask = jnp.expand_dims(level.block_indices[0] == -1, axis=(1, 2))
-            print(level.block_indices[0].shape)
-            print(mask.shape)
             filtered = jnp.where(mask, jnp.nan, vmapped)
 
             return filtered
 
-        return AMRGridFunction(self, 
+        return AMRGridFunction(self,
                                [approximate_single_level(i) for i in range(len(self.levels))])
 
 
@@ -299,7 +299,7 @@ class AMRGridFunction(eqx.Module):
                                 lambda: self.ghost_cells_boundary(level_idx, block_origin, dim, direction, boundary_condition),
                                 lambda: self.ghost_cells_interior(level_idx, block_origin, dim, direction))
         elif direction == 'right':
-            return jax.lax.cond(block_indices[dim] == grid.level_specs[level_idx].block_array_shape[dim],
+            return jax.lax.cond(block_indices[dim] == self.grid.level_specs[level_idx].block_array_shape[dim],
                                 lambda: self.ghost_cells_boundary(level_idx, block_origin, dim, direction, boundary_condition),
                                 lambda: self.ghost_cells_interior(level_idx, block_origin, dim, direction))
 
@@ -307,7 +307,7 @@ class AMRGridFunction(eqx.Module):
     @partial(jax.jit, static_argnums=(1, 3, 4))
     def ghost_cells_interior(self, level_idx, block_origin, dim, direction):
         '''
-        Returns the array of ghost cell values bordering the level-`level_idx` block 
+        Returns the array of ghost cell values bordering the level-`level_idx` block
         with origin `block_origin`, in `direction` along `dim`.
         '''
         grid = self.grid
@@ -322,34 +322,38 @@ class AMRGridFunction(eqx.Module):
         fine_ghost_cell_first_index = jax.tree.map(
                 lambda a: a.flatten()[0], fine_ghost_cell_indices)
 
-        for coarse_level_idx in range(level_idx):
-            decimate = lambda idx: idx // (2 ** (level_idx - coarse_level_idx))
-            coarse_level = grid.levels[coarse_level_idx]
+        for neighbor_level_idx in range(level_idx + 1):
+            if neighbor_level_idx < level_idx:
+                transfer_indices = lambda idx: idx // (2 ** (level_idx - neighbor_level_idx))
+            else:
+                transfer_indices = lambda idx: idx
+            neighbor_level = grid.levels[neighbor_level_idx]
 
-            # Find the coarse-level block that contains the requested cells
-            # Because the fine-level block is properly nested within the coarse level blocks
-            # at each level, we can simply find the coarse block that contains the first ghost cell
-            coarse_origin_of_fine_block = jax.tree.map(decimate, fine_ghost_cell_first_index)
-            coarse_block_idx = jax.tree.map(
+            # Find the neighbor-level block that contains the requested cells
+            # Because the fine-level block is properly nested within the neighbor level blocks
+            # at each level, we can simply find the neighbor block that contains the first ghost cell
+            neighbor_origin_of_fine_block = jax.tree.map(transfer_indices, fine_ghost_cell_first_index)
+            neighbor_block_idx = jax.tree.map(
                     lambda s, b_s: s // b_s,
-                    coarse_origin_of_fine_block, grid.level_specs[coarse_level_idx].block_shape)
-            coarse_block_origin = jax.tree.map(
+                    neighbor_origin_of_fine_block, grid.level_specs[neighbor_level_idx].block_shape)
+            neighbor_block_origin = jax.tree.map(
                     lambda s, b_s: s * b_s,
-                    coarse_block_idx, grid.level_specs[coarse_level_idx].block_shape)
+                    neighbor_block_idx, grid.level_specs[neighbor_level_idx].block_shape)
 
-            # Calculate the position in the coarse block of the requested cells
-            coarse_ghost_cell_indices = jax.tree.map(decimate, fine_ghost_cell_indices)
-            coarse_block_ghost_cell_offsets = jax.tree.map(
-                    lambda a, b: a - b, coarse_ghost_cell_indices, coarse_block_origin)
+            # Calculate the position in the neighbor block of the requested cells
+            neighbor_ghost_cell_indices = jax.tree.map(transfer_indices, fine_ghost_cell_indices)
+            neighbor_block_ghost_cell_offsets = jax.tree.map(
+                    lambda a, b: a - b, neighbor_ghost_cell_indices, neighbor_block_origin)
 
-            coarse_block_active_idx = coarse_level.block_index_map[coarse_block_idx]
-            coarse_values = self.level_values[coarse_level_idx][coarse_block_active_idx, ...]
-            coarse_ghost_cells = coarse_values[coarse_block_ghost_cell_offsets]
-            result = jax.lax.cond(coarse_block_active_idx == -1,
+            neighbor_block_active_idx = neighbor_level.block_index_map[neighbor_block_idx]
+            neighbor_values = self.level_values[neighbor_level_idx][neighbor_block_active_idx, ...]
+            neighbor_ghost_cells = neighbor_values[neighbor_block_ghost_cell_offsets]
+            result = jax.lax.cond(neighbor_block_active_idx == -1,
                                   lambda: result,
-                                  lambda: jnp.reshape(coarse_ghost_cells, result.shape))
+                                  lambda: jnp.reshape(neighbor_ghost_cells, result.shape))
 
         return result
+
 
     def ghost_cells_boundary(self, level_idx, block_origin, dim, direction, boundary_condition):
         grid = self.grid
@@ -369,16 +373,283 @@ class AMRGridFunction(eqx.Module):
         fine_copyout_cell_relative_indices = level_spec.block_copyout_cell_relative_indices(dim, direction)
         fine_copyout_cell_indices = jax.tree.map(
                 lambda a, b: a + b, block_origin, fine_copyout_cell_relative_indices)
-        jax.debug.print("{}", fine_copyout_cell_indices)
         copyout_cell_values = self.level_values[level_idx][block_active_idx][fine_copyout_cell_relative_indices]
         copyout_cell_values = jnp.reshape(copyout_cell_values,
                                           jax.tree.map(lambda a: a.shape[0], fine_copyout_cell_relative_indices))
-        jax.debug.print("{}", copyout_cell_values)
 
         coords = jax.tree.map(
                 lambda idx, coords, axis: jnp.take(coords, idx, axis=axis),
                 fine_copyout_cell_indices, center_coords, one_to_ndim)
 
         return boundary_condition(coords, copyout_cell_values)
-        
 
+
+    def copyout_cells(self, level_idx, block_origin, dim, direction):
+        grid = self.grid
+        level = grid.levels[level_idx]
+        level_spec = grid.level_specs[level_idx]
+        center_coords = grid.level_coordinates_center[level_idx]
+        ghost_cells_shape = [*level_spec.block_shape]
+        ghost_cells_shape[dim] = 1
+        result = jnp.zeros(ghost_cells_shape)
+
+        one_to_ndim = tuple(range(grid.n_dims))
+
+        block_indices = jax.tree.map(lambda s, b: s // b,
+                                     block_origin, level_spec.block_shape)
+        block_active_idx = level.block_index_map[block_indices]
+
+        fine_copyout_cell_relative_indices = level_spec.block_copyout_cell_relative_indices(dim, direction)
+        fine_copyout_cell_indices = jax.tree.map(
+                lambda a, b: a + b, block_origin, fine_copyout_cell_relative_indices)
+        copyout_cell_values = self.level_values[level_idx][block_active_idx][fine_copyout_cell_relative_indices]
+        copyout_cell_values = jnp.reshape(copyout_cell_values,
+                                          jax.tree.map(lambda a: a.shape[0], fine_copyout_cell_relative_indices))
+
+        return copyout_cell_values
+
+
+
+def normal_vector(dim, direction, n_dims):
+    result = [0.0]*n_dims
+    result[dim] = -1.0 if direction == 'left' else 1.0
+    return jnp.array(result)
+
+def exchange_crosslevel_fluxes(crosslevel_fluxes, level, dim, level_spec, n_dims):
+    if n_dims == 1:
+        return exchange_crosslevel_fluxes_1d(crosslevel_fluxes, level, level_spec, dim)
+    elif n_dims == 2:
+        return exchange_crosslevel_fluxes_2d(crosslevel_fluxes, level, level_spec, dim)
+
+
+def exchange_crosslevel_fluxes_1d(crosslevel_fluxes, level, level_spec, dim):
+    assert dim == 0
+    block_array_shape = level_spec.block_array_shape
+    return do_exchange_crosslevel_fluxes(crosslevel_fluxes, level, dim,
+        (jnp.arange(block_array_shape[0]-1), 1+jnp.arange(block_array_shape[0]-1)), (0, -1))
+
+    """
+    assert dim == 0
+    # For all active blocks which are bordered on the left by another
+    active_pairs = (level.block_index_map[:-1] != -1) & (level.block_index_map[1:] != -1)
+    pair_left_active_indices = jnp.where(active_pairs,
+        (level.block_index_map[:-1])[active_pairs],
+        -1).flatten()
+    pair_right_active_indices = jnp.where(active_pairs,
+        (level.block_index_map[1:])[active_pairs],
+        -1).flatten()
+
+    def coalesce_pair(carry, pair_active_indices):
+        pair_left_active_index, pair_right_active_index = pair_active_indices
+        # TODO: can we replace these two calls to tree_at with a call that modifies
+        # both locations at once by returning a tuple from "where"?
+        carry = eqx.tree_at(
+            where=lambda t: t[dim][pair_left_active_index],
+            pytree=carry,
+            replace_fn=lambda t: carry[dim][pair_left_active_index].at[-1] \
+                .set(first_non_nan(carry[dim][pair_left_active_index][-1],
+                                   carry[dim][pair_right_active_index][0])))
+        carry = eqx.tree_at(
+            where=lambda t: t[dim][pair_right_active_index],
+            pytree=carry,
+            replace_fn=lambda t: carry[dim][pair_right_active_index].at[0] \
+                .set(first_non_nan(carry[dim][pair_left_active_index][-1],
+                                   carry[dim][pair_right_active_index][0])))
+
+    def maybe_coalesce_pair(carry, pair_active_indices):
+        return jax.lax.cond(pair_active_indices[0] != -1,
+            lambda: coalesce_pair(carry, pair_active_indices),
+            lambda: carry)
+
+    crosslevel_fluxes = jax.lax.scan(maybe_coalesce_pair, crosslevel_fluxes,
+        (pair_left_active_indices, pair_right_active_indices))
+    """
+
+
+def exchange_crosslevel_fluxes_2d(crosslevel_fluxes, level, level_spec, dim):
+    block_array_shape = level_spec.block_array_shape
+    block_shape = level_spec.block_shape
+    if dim == 0:
+        return do_exchange_crosslevel_fluxes(crosslevel_fluxes, level, 0,
+            ((jnp.arange(block_array_shape[0]-1), jnp.arange(block_array_shape[1])),
+             (1+jnp.arange(block_array_shape[0]-1), jnp.arange(block_array_shape[1]))),
+            ((0, jnp.arange(block_shape[1])), (-1, jnp.arange(block_shape[1]))))
+    elif dim == 1:
+        return do_exchange_crosslevel_fluxes(crosslevel_fluxes, level, 1,
+            ((jnp.arange(block_array_shape[0]), jnp.arange(block_array_shape[1]-1)),
+             (jnp.arange(block_array_shape[0]), 1+jnp.arange(block_array_shape[1]-1))),
+            ((jnp.arange(block_shape[0]), 0), (jnp.arange(block_shape[0]), -1)))
+
+
+def do_exchange_crosslevel_fluxes(crosslevel_fluxes, level, dim,
+    leftright_block_index_map_shifts, leftright_slices):
+
+    leftshift, rightshift = leftright_block_index_map_shifts
+    active_pairs = (level.block_index_map[jnp.ix_(*leftshift)] != -1) & \
+        (level.block_index_map[jnp.ix_(*rightshift)] != -1)
+    pair_left_active_indices = jnp.where(active_pairs,
+        (level.block_index_map[jnp.ix_(*leftshift)]),
+        -1).flatten()
+    pair_right_active_indices = jnp.where(active_pairs,
+        (level.block_index_map[jnp.ix_(*rightshift)]),
+        -1).flatten()
+
+    def coalesce_pair(carry, pair_active_indices):
+        pair_left_active_index, pair_right_active_index = pair_active_indices
+        # TODO: can we replace these two calls to tree_at with a call that modifies
+        # both locations at once by returning a tuple from "where"?
+        left_slice, right_slice = leftright_slices
+        leftright_ixs = jnp.ix_(*map(jnp.atleast_1d, [pair_left_active_index, *right_slice]))
+        rightleft_ixs = jnp.ix_(*map(jnp.atleast_1d, [pair_right_active_index, *left_slice]))
+
+        print("leftright", leftright_ixs)
+        print("rightleft", rightleft_ixs)
+
+        carry = carry.at[leftright_ixs] \
+                .set(first_non_nan(carry[leftright_ixs],
+                                   carry[rightleft_ixs]))
+
+        carry = carry.at[rightleft_ixs] \
+                .set(first_non_nan(carry[leftright_ixs],
+                                   carry[rightleft_ixs]))
+        return carry
+
+    def maybe_coalesce_pair(carry, pair_active_indices):
+        carry = jax.lax.cond(pair_active_indices[0] != -1,
+            lambda: coalesce_pair(carry, pair_active_indices),
+            lambda: carry)
+
+        return carry, None
+
+    crosslevel_fluxes, _ = jax.lax.scan(maybe_coalesce_pair, crosslevel_fluxes,
+        (pair_left_active_indices, pair_right_active_indices))
+    return crosslevel_fluxes
+
+
+@partial(jax.jit, static_argnums=(1, 2))
+def flux_divergence(q, F_hat, bcs):
+    '''
+    params:
+        - q: The AMRGridFunction of unknowns
+        - F_hat: The numerical flux. A callable (q_in, q_out, n) -> n \cdot flux
+    '''
+    grid = q.grid
+    n_dims = grid.n_dims
+    n_levels = len(grid.levels)
+
+    def faces_array_shape(cells_array_shape, dim):
+        l = [*cells_array_shape]
+        # The leading dimension is the block number
+        l[dim+1] += 1
+        return tuple(l)
+
+    final_face_fluxes = [
+        tuple([jnp.nan * jnp.ones(faces_array_shape(q.level_values[i].shape, dim)) for dim in range(n_dims)])
+        for i in range(n_levels)
+    ]
+    intralevel_face_fluxes = [
+        tuple([jnp.nan * jnp.ones(faces_array_shape(q.level_values[i].shape, dim)) for dim in range(n_dims)])
+        for i in range(n_levels)
+    ]
+    crosslevel_face_fluxes = [
+        tuple([jnp.nan * jnp.ones(faces_array_shape(q.level_values[i].shape, dim)) for dim in range(n_dims)])
+        for i in range(n_levels)
+    ]
+
+    def block_fluxes(i, block_active_index, block_indices, dim):
+        block_origin = jax.tree.map(lambda s, b: s * b,
+                                    block_indices, grid.level_specs[i].block_shape)
+        left_ghost_cells = q.ghost_cells(i, block_origin, dim, 'left', bcs)
+        right_ghost_cells = q.ghost_cells(i, block_origin, dim, 'right', bcs)
+        interior_cells = q.level_values[i][block_active_index, ...]
+        all_cells = jnp.concatenate([left_ghost_cells, interior_cells, right_ghost_cells],
+                                    axis=dim)
+
+        left_cells = jnp.concatenate([left_ghost_cells, interior_cells], axis=dim)
+        right_cells = jnp.concatenate([interior_cells, right_ghost_cells], axis=dim)
+
+        n = normal_vector(dim, 'right', n_dims)
+        numerical_flux = F_hat(left_cells, right_cells, n)
+        return numerical_flux
+
+    # calculate fluxes at the finest level; these require no correction.
+    for dim in range(n_dims):
+        final_face_fluxes = eqx.tree_at(
+            where=lambda tree: tree[-1][dim],
+            pytree=final_face_fluxes,
+            replace_fn=lambda _: jax.vmap(
+                        lambda i, indices: block_fluxes(n_levels-1, i, indices, dim)
+                    )(jnp.arange(grid.level_specs[-1].n_blocks),
+                                 grid.levels[-1].block_indices))
+
+        for level_idx in range(n_levels-2, -1, -1):
+            fine_level_idx = level_idx+1
+
+            # For each active block at the fine level, transfer its face fluxes
+            def transfer_face_fluxes(crosslevel_fluxes, fine_block_active_index):
+                fine_block_indices = jax.tree.map(
+                    lambda indices: indices[fine_block_active_index],
+                    grid.levels[fine_level_idx].block_indices)
+                fine_block_origin = jax.tree.map(
+                    lambda idx, s: idx * s,
+                    fine_block_indices, grid.level_specs[fine_level_idx].block_shape)
+
+                coarse_block_origin = jax.tree.map(
+                    lambda origin: origin // 2,
+                    fine_block_origin)
+                coarse_block_indices = jax.tree.map(
+                    lambda origin, s: origin // s,
+                    coarse_block_origin, grid.level_specs[level_idx].block_shape)
+
+                offset = jax.tree.map(
+                    lambda coarse, fine: fine // 2 - coarse,
+                    coarse_block_origin, fine_block_origin)
+                coarse_block_slices = jax.tree.map(
+                    lambda o, s: o + jnp.arange(s // 2),
+                    offset, grid.level_specs[fine_level_idx].block_shape)
+
+                coarse_block_active_index = grid.levels[level_idx].block_index_map[coarse_block_indices]
+                fine_face_fluxes = final_face_fluxes[fine_level_idx][dim][fine_block_active_index]
+                coarsened_face_fluxes = coarsen_face_values_by_2(fine_face_fluxes, dim, n_dims)
+
+
+                crosslevel_fluxes = jax.lax.cond(fine_block_active_index >= grid.levels[fine_level_idx].n_active,
+                    lambda: crosslevel_fluxes,
+                    lambda: crosslevel_fluxes \
+                        .at[jnp.ix_(jnp.array([coarse_block_active_index]), *coarse_block_slices)].set(coarsened_face_fluxes))
+
+                return crosslevel_fluxes, None
+
+            # Transfer fine face fluxes to this level by aggregating
+            crosslevel_face_fluxes = eqx.tree_at(
+                where=lambda tree: tree[level_idx][dim],
+                pytree=crosslevel_face_fluxes,
+                replace_fn=lambda crosslevel_fluxes: jax.lax.scan(transfer_face_fluxes, crosslevel_fluxes,
+                    jnp.arange(grid.level_specs[fine_level_idx].n_blocks))[0])
+
+            # Exchange crosslevel face fluxes between neighboring blocks
+            crosslevel_face_fluxes = eqx.tree_at(
+                where=lambda tree: tree[level_idx][dim],
+                pytree=crosslevel_face_fluxes,
+                replace_fn=lambda t: exchange_crosslevel_fluxes(t, grid.levels[level_idx],
+                    dim, grid.level_specs[level_idx], n_dims))
+
+            intralevel_face_fluxes = eqx.tree_at(
+                where=lambda tree: tree[level_idx][dim],
+                pytree=intralevel_face_fluxes,
+                replace_fn=lambda _: jax.vmap(
+                            lambda i, indices: block_fluxes(level_idx, i, indices, dim)
+                        )(jnp.arange(grid.level_specs[level_idx].n_blocks),
+                                    grid.levels[level_idx].block_indices))
+
+            def finalize_face_fluxes(_):
+                crosslevel_fluxes = crosslevel_face_fluxes[level_idx][dim]
+                intralevel_fluxes = intralevel_face_fluxes[level_idx][dim]
+                return jnp.where(jnp.isnan(crosslevel_fluxes), intralevel_fluxes, crosslevel_fluxes)
+                #return jax.tree.map(lambda cross, intra: jnp.where(jnp.isnan(cross), intra, cross),
+                    #crosslevel_fluxes, intralevel_fluxes)
+
+            final_face_fluxes = eqx.tree_at(
+                where=lambda tree: tree[level_idx][dim],
+                pytree=final_face_fluxes,
+                replace_fn=finalize_face_fluxes)
