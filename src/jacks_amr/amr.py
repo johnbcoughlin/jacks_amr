@@ -276,7 +276,7 @@ class AMRGridFunction(eqx.Module):
 
 
     @partial(jax.jit, static_argnums=(1, 3, 4))
-    def ghost_cells(self, level_idx, block_origin, dim, direction):
+    def ghost_cells_interior(self, level_idx, block_origin, dim, direction):
         '''
         Returns the array of ghost cell values bordering the level-`level_idx` block 
         with origin `block_origin`, in `direction` along `dim`.
