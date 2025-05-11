@@ -6,20 +6,29 @@ import jax
 from jaxtyping import Array, Bool, PyTree, PyTreeDef
 import math
 from functools import partial
-from .arrays import coarsen_face_values_by_2, first_non_nan
+from .arrays import coarsen_face_values_by_2, first_non_nan, flux_differences_for_divergence
 
 class AMRLevelSpec(eqx.Module):
     n_blocks: int
     block_array_shape: PyTree
     block_shape: PyTree
+    face_block_shapes: PyTree
     level_shape: PyTree
 
     def __init__(self, level, L0_shape, n_blocks, block_shape):
         level_shape = jax.tree.map(lambda s: s * (2**level), L0_shape)
 
+        n_dims = len(block_shape)
         self.n_blocks = n_blocks
         self.block_array_shape = jax.tree.map(lambda s1, s2: int(s1 / s2), level_shape, block_shape)
         self.block_shape = block_shape
+
+        face_block_shapes = []
+        for dim in range(n_dims):
+            L = list(block_shape)
+            L[dim] = L[dim] + 1
+            face_block_shapes.append(tuple(L))
+        self.face_block_shapes = tuple(face_block_shapes)
         self.level_shape = level_shape
 
 
@@ -96,6 +105,7 @@ class AMRGridFactory():
         self.L0_shape = L0_shape
         self.lower = lower
         self.upper = upper
+        self.L0_dx = jax.tree.map(lambda l, u, s: (u - l) / s, lower, upper, L0_shape)
         self.level_specs = level_specs
 
         self.n_dims = len(L0_shape)
@@ -163,7 +173,8 @@ class AMRGridFactory():
                 lambda arr: arr.at[:].set(0),
                 levels[0].block_indices)
         levels[0] = AMRLevel(block_index_map, 1, block_indices)
-        return AMRGrid(self.n_dims, levels, self.level_specs, self.level_coordinates_center)
+        return AMRGrid(self.n_dims, levels, self.level_specs, 
+            self.level_coordinates_center, self)
 
 
     @partial(jax.jit, static_argnums=(0, 1, 2))
@@ -245,12 +256,14 @@ class AMRGrid(eqx.Module):
     levels: list[AMRLevel]
     level_specs: list[AMRLevelSpec] = eqx.field(static=True)
     level_coordinates_center: list[PyTree]
+    grid_factory: AMRGridFactory = eqx.field(static=True)
 
-    def __init__(self, n_dims, levels, level_specs, level_coordinates_center):
+    def __init__(self, n_dims, levels, level_specs, level_coordinates_center, grid_factory):
         self.n_dims = n_dims
         self.levels = levels
         self.level_specs = level_specs
         self.level_coordinates_center = level_coordinates_center
+        self.grid_factory = grid_factory
 
 
     @partial(jax.jit, static_argnums=(1,))
@@ -299,7 +312,7 @@ class AMRGridFunction(eqx.Module):
                                 lambda: self.ghost_cells_boundary(level_idx, block_origin, dim, direction, boundary_condition),
                                 lambda: self.ghost_cells_interior(level_idx, block_origin, dim, direction))
         elif direction == 'right':
-            return jax.lax.cond(block_indices[dim] == self.grid.level_specs[level_idx].block_array_shape[dim],
+            return jax.lax.cond(block_indices[dim] == self.grid.level_specs[level_idx].block_array_shape[dim]-1,
                                 lambda: self.ghost_cells_boundary(level_idx, block_origin, dim, direction, boundary_condition),
                                 lambda: self.ghost_cells_interior(level_idx, block_origin, dim, direction))
 
@@ -373,7 +386,7 @@ class AMRGridFunction(eqx.Module):
         fine_copyout_cell_relative_indices = level_spec.block_copyout_cell_relative_indices(dim, direction)
         fine_copyout_cell_indices = jax.tree.map(
                 lambda a, b: a + b, block_origin, fine_copyout_cell_relative_indices)
-        copyout_cell_values = self.level_values[level_idx][block_active_idx][fine_copyout_cell_relative_indices]
+        copyout_cell_values = self.level_values[level_idx][block_active_idx, *fine_copyout_cell_relative_indices]
         copyout_cell_values = jnp.reshape(copyout_cell_values,
                                           jax.tree.map(lambda a: a.shape[0], fine_copyout_cell_relative_indices))
 
@@ -400,8 +413,6 @@ class AMRGridFunction(eqx.Module):
         block_active_idx = level.block_index_map[block_indices]
 
         fine_copyout_cell_relative_indices = level_spec.block_copyout_cell_relative_indices(dim, direction)
-        fine_copyout_cell_indices = jax.tree.map(
-                lambda a, b: a + b, block_origin, fine_copyout_cell_relative_indices)
         copyout_cell_values = self.level_values[level_idx][block_active_idx][fine_copyout_cell_relative_indices]
         copyout_cell_values = jnp.reshape(copyout_cell_values,
                                           jax.tree.map(lambda a: a.shape[0], fine_copyout_cell_relative_indices))
@@ -531,11 +542,12 @@ def flux_divergence(q, F_hat, bcs):
     '''
     params:
         - q: The AMRGridFunction of unknowns
-        - F_hat: The numerical flux. A callable (q_in, q_out, n) -> n \cdot flux
+        - F_hat: The numerical flux. A callable (q_in, q_out, n) -> n cdot flux
     '''
     grid = q.grid
     n_dims = grid.n_dims
     n_levels = len(grid.levels)
+    L0_dx = grid.grid_factory.L0_dx
 
     def faces_array_shape(cells_array_shape, dim):
         l = [*cells_array_shape]
@@ -556,12 +568,12 @@ def flux_divergence(q, F_hat, bcs):
         for i in range(n_levels)
     ]
 
-    def block_fluxes(i, block_active_index, block_indices, dim):
+    def block_fluxes(level_idx, block_active_index, block_indices, dim):
         block_origin = jax.tree.map(lambda s, b: s * b,
-                                    block_indices, grid.level_specs[i].block_shape)
-        left_ghost_cells = q.ghost_cells(i, block_origin, dim, 'left', bcs)
-        right_ghost_cells = q.ghost_cells(i, block_origin, dim, 'right', bcs)
-        interior_cells = q.level_values[i][block_active_index, ...]
+                                    block_indices, grid.level_specs[level_idx].block_shape)
+        left_ghost_cells = q.ghost_cells(level_idx, block_origin, dim, 'left', bcs)
+        right_ghost_cells = q.ghost_cells(level_idx, block_origin, dim, 'right', bcs)
+        interior_cells = q.level_values[level_idx][block_active_index, ...]
         all_cells = jnp.concatenate([left_ghost_cells, interior_cells, right_ghost_cells],
                                     axis=dim)
 
@@ -570,7 +582,8 @@ def flux_divergence(q, F_hat, bcs):
 
         n = normal_vector(dim, 'right', n_dims)
         numerical_flux = F_hat(left_cells, right_cells, n)
-        return numerical_flux
+        dx = L0_dx[dim] / (2**level_idx)
+        return numerical_flux * dx
 
     # calculate fluxes at the finest level; these require no correction.
     for dim in range(n_dims):
@@ -595,8 +608,8 @@ def flux_divergence(q, F_hat, bcs):
                     fine_block_indices, grid.level_specs[fine_level_idx].block_shape)
 
                 coarse_block_origin = jax.tree.map(
-                    lambda origin: origin // 2,
-                    fine_block_origin)
+                    lambda origin, coarse_block_shape: coarse_block_shape * (origin // 2 // coarse_block_shape),
+                    fine_block_origin, grid.level_specs[level_idx].block_shape)
                 coarse_block_indices = jax.tree.map(
                     lambda origin, s: origin // s,
                     coarse_block_origin, grid.level_specs[level_idx].block_shape)
@@ -605,13 +618,12 @@ def flux_divergence(q, F_hat, bcs):
                     lambda coarse, fine: fine // 2 - coarse,
                     coarse_block_origin, fine_block_origin)
                 coarse_block_slices = jax.tree.map(
-                    lambda o, s: o + jnp.arange(s // 2),
-                    offset, grid.level_specs[fine_level_idx].block_shape)
+                    lambda o, s: o + jnp.arange((s+1) // 2),
+                    offset, grid.level_specs[fine_level_idx].face_block_shapes[dim])
 
                 coarse_block_active_index = grid.levels[level_idx].block_index_map[coarse_block_indices]
                 fine_face_fluxes = final_face_fluxes[fine_level_idx][dim][fine_block_active_index]
                 coarsened_face_fluxes = coarsen_face_values_by_2(fine_face_fluxes, dim, n_dims)
-
 
                 crosslevel_fluxes = jax.lax.cond(fine_block_active_index >= grid.levels[fine_level_idx].n_active,
                     lambda: crosslevel_fluxes,
@@ -646,10 +658,19 @@ def flux_divergence(q, F_hat, bcs):
                 crosslevel_fluxes = crosslevel_face_fluxes[level_idx][dim]
                 intralevel_fluxes = intralevel_face_fluxes[level_idx][dim]
                 return jnp.where(jnp.isnan(crosslevel_fluxes), intralevel_fluxes, crosslevel_fluxes)
-                #return jax.tree.map(lambda cross, intra: jnp.where(jnp.isnan(cross), intra, cross),
-                    #crosslevel_fluxes, intralevel_fluxes)
+
 
             final_face_fluxes = eqx.tree_at(
                 where=lambda tree: tree[level_idx][dim],
                 pytree=final_face_fluxes,
                 replace_fn=finalize_face_fluxes)
+
+    div_F = [jnp.zeros_like(q.level_values[i]) for i in range(n_levels)]
+    for i in range(n_levels):
+        div_F = eqx.tree_at(
+            where=lambda t: t[i],
+            pytree=div_F,
+            replace_fn=lambda t: t + flux_differences_for_divergence(final_face_fluxes[i], n_dims)
+        )
+
+    return div_F
