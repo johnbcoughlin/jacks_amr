@@ -3,6 +3,8 @@ sys.path.append("src")
 sys.path.append("tests")
 
 from jacks_amr import amr
+from jacks_amr.flux_divergence import flux_divergence
+
 from util import construct_example_grid
 import jax.numpy as jnp
 import jax
@@ -21,7 +23,7 @@ def test_flux_divergence():
 
     copyout_bcs = lambda coords, copyout_values: copyout_values
 
-    div_F = amr.flux_divergence(q, flux, copyout_bcs)
+    div_F = flux_divergence(q, flux, copyout_bcs)
 
     a1 = f(0.25, 0.25)
     c1 = f(1/16, 9/16)

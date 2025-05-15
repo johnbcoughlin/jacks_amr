@@ -6,7 +6,6 @@ import jax
 from jaxtyping import Array, Bool, PyTree, PyTreeDef
 import math
 from functools import partial
-from .arrays import coarsen_face_values_by_2, first_non_nan, flux_differences_for_divergence
 
 class AMRLevelSpec(eqx.Module):
     n_blocks: int
@@ -304,14 +303,14 @@ class AMRGridFunction(eqx.Module):
         self.level_values = level_values
 
 
-    def ghost_cells(self, level_idx, block_origin, dim, direction, boundary_condition):
+    def ghost_cells(self, level_idx, block_origin, dim, direction, boundary_condition) -> jnp.ndarray:
         block_indices = jax.tree.map(lambda s, shape: s // shape,
                                      block_origin, self.grid.level_specs[level_idx].block_shape)
         if direction == 'left':
             return jax.lax.cond(block_indices[dim] == 0,
                                 lambda: self.ghost_cells_boundary(level_idx, block_origin, dim, direction, boundary_condition),
                                 lambda: self.ghost_cells_interior(level_idx, block_origin, dim, direction))
-        elif direction == 'right':
+        else: # direction == 'right'
             return jax.lax.cond(block_indices[dim] == self.grid.level_specs[level_idx].block_array_shape[dim]-1,
                                 lambda: self.ghost_cells_boundary(level_idx, block_origin, dim, direction, boundary_condition),
                                 lambda: self.ghost_cells_interior(level_idx, block_origin, dim, direction))
@@ -439,43 +438,6 @@ def exchange_crosslevel_fluxes_1d(crosslevel_fluxes, level, level_spec, dim):
     return do_exchange_crosslevel_fluxes(crosslevel_fluxes, level, dim,
         (jnp.arange(block_array_shape[0]-1), 1+jnp.arange(block_array_shape[0]-1)), (0, -1))
 
-    """
-    assert dim == 0
-    # For all active blocks which are bordered on the left by another
-    active_pairs = (level.block_index_map[:-1] != -1) & (level.block_index_map[1:] != -1)
-    pair_left_active_indices = jnp.where(active_pairs,
-        (level.block_index_map[:-1])[active_pairs],
-        -1).flatten()
-    pair_right_active_indices = jnp.where(active_pairs,
-        (level.block_index_map[1:])[active_pairs],
-        -1).flatten()
-
-    def coalesce_pair(carry, pair_active_indices):
-        pair_left_active_index, pair_right_active_index = pair_active_indices
-        # TODO: can we replace these two calls to tree_at with a call that modifies
-        # both locations at once by returning a tuple from "where"?
-        carry = eqx.tree_at(
-            where=lambda t: t[dim][pair_left_active_index],
-            pytree=carry,
-            replace_fn=lambda t: carry[dim][pair_left_active_index].at[-1] \
-                .set(first_non_nan(carry[dim][pair_left_active_index][-1],
-                                   carry[dim][pair_right_active_index][0])))
-        carry = eqx.tree_at(
-            where=lambda t: t[dim][pair_right_active_index],
-            pytree=carry,
-            replace_fn=lambda t: carry[dim][pair_right_active_index].at[0] \
-                .set(first_non_nan(carry[dim][pair_left_active_index][-1],
-                                   carry[dim][pair_right_active_index][0])))
-
-    def maybe_coalesce_pair(carry, pair_active_indices):
-        return jax.lax.cond(pair_active_indices[0] != -1,
-            lambda: coalesce_pair(carry, pair_active_indices),
-            lambda: carry)
-
-    crosslevel_fluxes = jax.lax.scan(maybe_coalesce_pair, crosslevel_fluxes,
-        (pair_left_active_indices, pair_right_active_indices))
-    """
-
 
 def exchange_crosslevel_fluxes_2d(crosslevel_fluxes, level, level_spec, dim):
     block_array_shape = level_spec.block_array_shape
@@ -537,140 +499,3 @@ def do_exchange_crosslevel_fluxes(crosslevel_fluxes, level, dim,
     return crosslevel_fluxes
 
 
-@partial(jax.jit, static_argnums=(1, 2))
-def flux_divergence(q, F_hat, bcs):
-    '''
-    params:
-        - q: The AMRGridFunction of unknowns
-        - F_hat: The numerical flux. A callable (q_in, q_out, n) -> n cdot flux
-    '''
-    grid = q.grid
-    n_dims = grid.n_dims
-    n_levels = len(grid.levels)
-    L0_dx = grid.grid_factory.L0_dx
-
-    def faces_array_shape(cells_array_shape, dim):
-        l = [*cells_array_shape]
-        # The leading dimension is the block number
-        l[dim+1] += 1
-        return tuple(l)
-
-    final_face_fluxes = [
-        tuple([jnp.nan * jnp.ones(faces_array_shape(q.level_values[i].shape, dim)) for dim in range(n_dims)])
-        for i in range(n_levels)
-    ]
-    intralevel_face_fluxes = [
-        tuple([jnp.nan * jnp.ones(faces_array_shape(q.level_values[i].shape, dim)) for dim in range(n_dims)])
-        for i in range(n_levels)
-    ]
-    crosslevel_face_fluxes = [
-        tuple([jnp.nan * jnp.ones(faces_array_shape(q.level_values[i].shape, dim)) for dim in range(n_dims)])
-        for i in range(n_levels)
-    ]
-
-    def block_fluxes(level_idx, block_active_index, block_indices, dim):
-        block_origin = jax.tree.map(lambda s, b: s * b,
-                                    block_indices, grid.level_specs[level_idx].block_shape)
-        left_ghost_cells = q.ghost_cells(level_idx, block_origin, dim, 'left', bcs)
-        right_ghost_cells = q.ghost_cells(level_idx, block_origin, dim, 'right', bcs)
-        interior_cells = q.level_values[level_idx][block_active_index, ...]
-        all_cells = jnp.concatenate([left_ghost_cells, interior_cells, right_ghost_cells],
-                                    axis=dim)
-
-        left_cells = jnp.concatenate([left_ghost_cells, interior_cells], axis=dim)
-        right_cells = jnp.concatenate([interior_cells, right_ghost_cells], axis=dim)
-
-        n = normal_vector(dim, 'right', n_dims)
-        numerical_flux = F_hat(left_cells, right_cells, n)
-        dx = L0_dx[dim] / (2**level_idx)
-        return numerical_flux * dx
-
-    # calculate fluxes at the finest level; these require no correction.
-    for dim in range(n_dims):
-        final_face_fluxes = eqx.tree_at(
-            where=lambda tree: tree[-1][dim],
-            pytree=final_face_fluxes,
-            replace_fn=lambda _: jax.vmap(
-                        lambda i, indices: block_fluxes(n_levels-1, i, indices, dim)
-                    )(jnp.arange(grid.level_specs[-1].n_blocks),
-                                 grid.levels[-1].block_indices))
-
-        for level_idx in range(n_levels-2, -1, -1):
-            fine_level_idx = level_idx+1
-
-            # For each active block at the fine level, transfer its face fluxes
-            def transfer_face_fluxes(crosslevel_fluxes, fine_block_active_index):
-                fine_block_indices = jax.tree.map(
-                    lambda indices: indices[fine_block_active_index],
-                    grid.levels[fine_level_idx].block_indices)
-                fine_block_origin = jax.tree.map(
-                    lambda idx, s: idx * s,
-                    fine_block_indices, grid.level_specs[fine_level_idx].block_shape)
-
-                coarse_block_origin = jax.tree.map(
-                    lambda origin, coarse_block_shape: coarse_block_shape * (origin // 2 // coarse_block_shape),
-                    fine_block_origin, grid.level_specs[level_idx].block_shape)
-                coarse_block_indices = jax.tree.map(
-                    lambda origin, s: origin // s,
-                    coarse_block_origin, grid.level_specs[level_idx].block_shape)
-
-                offset = jax.tree.map(
-                    lambda coarse, fine: fine // 2 - coarse,
-                    coarse_block_origin, fine_block_origin)
-                coarse_block_slices = jax.tree.map(
-                    lambda o, s: o + jnp.arange((s+1) // 2),
-                    offset, grid.level_specs[fine_level_idx].face_block_shapes[dim])
-
-                coarse_block_active_index = grid.levels[level_idx].block_index_map[coarse_block_indices]
-                fine_face_fluxes = final_face_fluxes[fine_level_idx][dim][fine_block_active_index]
-                coarsened_face_fluxes = coarsen_face_values_by_2(fine_face_fluxes, dim, n_dims)
-
-                crosslevel_fluxes = jax.lax.cond(fine_block_active_index >= grid.levels[fine_level_idx].n_active,
-                    lambda: crosslevel_fluxes,
-                    lambda: crosslevel_fluxes \
-                        .at[jnp.ix_(jnp.array([coarse_block_active_index]), *coarse_block_slices)].set(coarsened_face_fluxes))
-
-                return crosslevel_fluxes, None
-
-            # Transfer fine face fluxes to this level by aggregating
-            crosslevel_face_fluxes = eqx.tree_at(
-                where=lambda tree: tree[level_idx][dim],
-                pytree=crosslevel_face_fluxes,
-                replace_fn=lambda crosslevel_fluxes: jax.lax.scan(transfer_face_fluxes, crosslevel_fluxes,
-                    jnp.arange(grid.level_specs[fine_level_idx].n_blocks))[0])
-
-            # Exchange crosslevel face fluxes between neighboring blocks
-            crosslevel_face_fluxes = eqx.tree_at(
-                where=lambda tree: tree[level_idx][dim],
-                pytree=crosslevel_face_fluxes,
-                replace_fn=lambda t: exchange_crosslevel_fluxes(t, grid.levels[level_idx],
-                    dim, grid.level_specs[level_idx], n_dims))
-
-            intralevel_face_fluxes = eqx.tree_at(
-                where=lambda tree: tree[level_idx][dim],
-                pytree=intralevel_face_fluxes,
-                replace_fn=lambda _: jax.vmap(
-                            lambda i, indices: block_fluxes(level_idx, i, indices, dim)
-                        )(jnp.arange(grid.level_specs[level_idx].n_blocks),
-                                    grid.levels[level_idx].block_indices))
-
-            def finalize_face_fluxes(_):
-                crosslevel_fluxes = crosslevel_face_fluxes[level_idx][dim]
-                intralevel_fluxes = intralevel_face_fluxes[level_idx][dim]
-                return jnp.where(jnp.isnan(crosslevel_fluxes), intralevel_fluxes, crosslevel_fluxes)
-
-
-            final_face_fluxes = eqx.tree_at(
-                where=lambda tree: tree[level_idx][dim],
-                pytree=final_face_fluxes,
-                replace_fn=finalize_face_fluxes)
-
-    div_F = [jnp.zeros_like(q.level_values[i]) for i in range(n_levels)]
-    for i in range(n_levels):
-        div_F = eqx.tree_at(
-            where=lambda t: t[i],
-            pytree=div_F,
-            replace_fn=lambda t: t + flux_differences_for_divergence(final_face_fluxes[i], n_dims)
-        )
-
-    return div_F
