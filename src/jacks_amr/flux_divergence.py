@@ -25,7 +25,6 @@ def flux_divergence(q, F_hat, bcs):
     grid = q.grid
     n_dims = grid.n_dims
     n_levels = len(grid.levels)
-    L0_dx = grid.grid_factory.L0_dx
     
     # Using a single-point quadrature...
     def numerical_flux_face_integral(q_in, q_out, n, face_area):
@@ -42,4 +41,4 @@ def flux_divergence(q, F_hat, bcs):
             replace_fn=lambda t: t + flux_differences_for_divergence(final_face_fluxes[i], n_dims)
         )
 
-    return div_F
+    return AMRGridFunction(grid, div_F)

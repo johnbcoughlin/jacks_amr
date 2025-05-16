@@ -89,9 +89,6 @@ def do_exchange_crosslevel_values(crosslevel_values, level, dim,
         leftright_ixs = jnp.ix_(*map(jnp.atleast_1d, [pair_left_active_index, *right_slice]))
         rightleft_ixs = jnp.ix_(*map(jnp.atleast_1d, [pair_right_active_index, *left_slice]))
 
-        print("leftright", leftright_ixs)
-        print("rightleft", rightleft_ixs)
-
         carry = carry.at[leftright_ixs] \
                 .set(first_non_nan(carry[leftright_ixs],
                                    carry[rightleft_ixs]))

@@ -53,10 +53,11 @@ for i, level in enumerate(grid.levels):
     coords = AMR.level_coordinates_lower[i]
     for j in range(level.n_active):
         block_indices = jax.tree.map(lambda a: a[j], level.block_indices)
+        block_origin = grid.indices_to_origin(i, block_indices)
         for k1 in range(spec.block_shape[0]):
             for k2 in range(spec.block_shape[1]):
-                s1 = block_indices[0] + k1
-                s2 = block_indices[1] + k2
+                s1 = block_origin[0] + k1
+                s2 = block_origin[1] + k2
                 rect = mpl.patches.Rectangle(
                         (coords[0].flatten()[s1], coords[1].flatten()[s2]), dx, dx,
                         linewidth=1,
