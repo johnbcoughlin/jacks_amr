@@ -50,7 +50,8 @@ def exchange_crosslevel_values_1d(crosslevel_values, level, level_spec, dim):
     assert dim == 0
     block_array_shape = level_spec.block_array_shape
     return do_exchange_crosslevel_values(crosslevel_values, level, dim,
-        (jnp.arange(block_array_shape[0]-1), 1+jnp.arange(block_array_shape[0]-1)), (0, -1))
+        ((jnp.arange(block_array_shape[0]-1),), (1+jnp.arange(block_array_shape[0]-1),)), 
+        ((0,), (-1,)))
 
 
 def exchange_crosslevel_values_2d(crosslevel_values, level, level_spec, dim):

@@ -301,10 +301,13 @@ class AMRGrid(eqx.Module):
                         lambda origin, block_size, coords, axis: jnp.take(
                             coords, origin + jnp.arange(block_size), axis=axis),
                         block_origin, spec.block_shape, center_coords, one_to_ndim)
+                jax.debug.print("coords: {}", coords[0].shape)
                 return f(*coords)
 
             vmapped = jax.vmap(approximate_single_block)(level.block_indices)
-            mask = jnp.expand_dims(level.block_indices[0] == -1, axis=(1, 2))
+            jax.debug.print("vmapped: {}", vmapped.shape)
+            new_axes = [dim+1 for dim in range(self.n_dims)]
+            mask = jnp.expand_dims(level.block_indices[0] == -1, axis=new_axes)
             filtered = jnp.where(mask, jnp.nan, vmapped)
 
             return filtered
@@ -455,11 +458,14 @@ class AMRGridFunction(eqx.Module):
                     lambda a, b: a - b, neighbor_ghost_cell_indices, neighbor_block_origin)
 
             neighbor_block_active_idx = neighbor_level.block_index_map[neighbor_block_idx]
+            # indexer = jnp.ix_(
+            #     jnp.array([neighbor_block_active_idx]),
+            #     *neighbor_block_ghost_cell_offsets)
             neighbor_values = self.level_values[neighbor_level_idx][neighbor_block_active_idx, ...]
             neighbor_ghost_cells = neighbor_values[neighbor_block_ghost_cell_offsets]
             result = jax.lax.cond(neighbor_block_active_idx == -1,
                                   lambda: result,
-                                  lambda: jnp.reshape(neighbor_ghost_cells, result.shape))
+                                  lambda: neighbor_ghost_cells)
 
         return result
 
@@ -482,9 +488,11 @@ class AMRGridFunction(eqx.Module):
         fine_copyout_cell_relative_indices = level_spec.block_copyout_cell_relative_indices(dim, direction)
         fine_copyout_cell_indices = jax.tree.map(
                 lambda a, b: a + b, block_origin, fine_copyout_cell_relative_indices)
-        copyout_cell_values = self.level_values[level_idx][block_active_idx, *fine_copyout_cell_relative_indices]
-        copyout_cell_values = jnp.reshape(copyout_cell_values,
-                                          jax.tree.map(lambda a: a.shape[0], fine_copyout_cell_relative_indices))
+        indexer = jnp.ix_(*fine_copyout_cell_relative_indices)
+        copyout_cell_values = self.level_values[level_idx][block_active_idx, ...]
+        copyout_cell_values = copyout_cell_values[indexer]
+        #copyout_cell_values = jnp.reshape(copyout_cell_values,
+                                          #jax.tree.map(lambda a: a.shape[0], fine_copyout_cell_relative_indices))
 
         coords = jax.tree.map(
                 lambda idx, coords, axis: jnp.take(coords, idx, axis=axis),
