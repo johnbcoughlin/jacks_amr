@@ -193,26 +193,27 @@ class AMRGridFactory():
             }
 
             def evaluate_criteria_in_coarse_block(coarse_block_indices):
+                coarse_block_origin = grid.indices_to_origin(level_idx, coarse_block_indices)
                 coarse_coords = jax.tree.map(
                         lambda idxs, coords, axis: jnp.take(coords, idxs, axis=axis),
-                        coarse_block_indices, coarse["center_coords"], one_to_ndim)
+                        coarse_block_origin, coarse["center_coords"], one_to_ndim)
 
                 # Find all fine blocks that lie inside the current coarse block
-                contained_fine_block_indices = jax.tree.map(
+                contained_fine_block_origin = jax.tree.map(
                         lambda coarse_idx, coarse_block_size, fine_block_size, dim: coarse_idx*2 + jnp.arange(0, coarse_block_size*2, fine_block_size),
-                        coarse_block_indices, coarse["spec"].block_shape, fine["spec"].block_shape, one_to_ndim)
-                flattened_fine_block_indices = jax.tree.map(
+                        coarse_block_origin, coarse["spec"].block_shape, fine["spec"].block_shape, one_to_ndim)
+                flattened_fine_block_origins = jax.tree.map(
                         lambda a: a.flatten(),
-                        tuple(jnp.meshgrid(*contained_fine_block_indices, indexing='ij')))
+                        tuple(jnp.meshgrid(*contained_fine_block_origin, indexing='ij')))
 
                 # Evaluate the refinement criterion for the fine block and activate it if necessary.
-                def single_block_criterion(fine_block_indices):
+                def single_block_criterion(fine_block_origin):
                     fine_coords = jax.tree.map(
-                            lambda idx, fine_block_size, coords, axis: jnp.take(coords, idx + jnp.arange(fine_block_size), axis=axis),
-                            fine_block_indices, fine["spec"].block_shape, fine["center_coords"], one_to_ndim)
+                            lambda origin, fine_block_size, coords, axis: jnp.take(coords, origin + jnp.arange(fine_block_size), axis=axis),
+                            fine_block_origin, fine["spec"].block_shape, fine["center_coords"], one_to_ndim)
                     comparable_coarse_coords = jax.tree.map(
-                            lambda idx, fine_block_size, coords, axis: jnp.take(coords, idx // 2 + jnp.arange(fine_block_size // 2), axis=axis),
-                            fine_block_indices, fine["spec"].block_shape, coarse["center_coords"], one_to_ndim)
+                            lambda origin, fine_block_size, coords, axis: jnp.take(coords, origin // 2 + jnp.arange(fine_block_size // 2), axis=axis),
+                            fine_block_origin, fine["spec"].block_shape, coarse["center_coords"], one_to_ndim)
 
                     fine_values = f(*fine_coords)
                     coarse_values = jnp.tile(f(*comparable_coarse_coords), [2]*self.n_dims)
@@ -220,27 +221,25 @@ class AMRGridFactory():
                     return refinement_criterion(coarse_values, fine_values)
 
 
-                fine_block_criteria = jax.vmap(single_block_criterion)(flattened_fine_block_indices)
+                fine_block_criteria = jax.vmap(single_block_criterion)(flattened_fine_block_origins)
 
-                return fine_block_criteria, flattened_fine_block_indices
+                return fine_block_criteria, flattened_fine_block_origins
 
-            fine_block_criteria, flattened_fine_block_indices = jax.vmap(evaluate_criteria_in_coarse_block)(grid.levels[level_idx].block_indices)
+            fine_block_criteria, flattened_fine_block_origins = jax.vmap(evaluate_criteria_in_coarse_block)(grid.levels[level_idx].block_indices)
             filtered_criteria = jnp.where(jnp.expand_dims(grid.levels[level_idx].block_indices[0] == -1, axis=1),
                                           -jnp.inf,
                                           fine_block_criteria)
             sorted_idcs = jnp.argsort(filtered_criteria.flatten())
 
-            def with_block_active(carry_grid, fine_block_indices):
-                block_indices = jax.tree.map(
-                        lambda s: s,
-                        fine_block_indices)
+            def with_block_active(carry_grid, fine_block_origin):
+                block_indices = carry_grid.origin_to_indices(level_idx+1, fine_block_origin)
                 carry_grid = eqx.tree_at(where=lambda grid: grid.levels[level_idx+1],
                                    pytree=carry_grid,
                                    replace_fn=lambda level: level.with_block_active(block_indices))
                 return carry_grid, None
 
             K = 10 * (2**level_idx)
-            top_K_blocks = jax.tree.map(lambda a: a.flatten()[sorted_idcs[-K:]], flattened_fine_block_indices)
+            top_K_blocks = jax.tree.map(lambda a: a.flatten()[sorted_idcs[-K:]], flattened_fine_block_origins)
             refined_grid, _ = jax.lax.scan(with_block_active, grid, top_K_blocks)
             return refined_grid
 
@@ -341,7 +340,7 @@ class AMRGrid(eqx.Module):
             lambda coarse_size, fine_size: (coarse_size * 2) // fine_size,
             grid.level_specs[coarse_level_idx].block_shape, grid.level_specs[coarse_level_idx+1].block_shape)
         indexer = jnp.ix_(
-            *jax.tree.map(lambda o, n: o + jnp.arange(n)),
+            *jax.tree.map(lambda o, n: o + jnp.arange(n),
                 fine_block_indices, n_blocks_per))
         return indexer
         
