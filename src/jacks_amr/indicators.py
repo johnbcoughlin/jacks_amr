@@ -3,8 +3,9 @@ from .flux_divergence import flux_differences_for_divergence
 import jax.numpy as jnp
 import jax
 import equinox as eqx
+from functools import partial
 
-
+@partial(jax.jit, static_argnums=(1,))
 def approximate_gradient_indicator(q, bcs):
     grid = q.grid
     n_dims = grid.n_dims
