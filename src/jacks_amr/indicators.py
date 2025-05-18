@@ -5,6 +5,8 @@ import jax
 import equinox as eqx
 from functools import partial
 
+from jacks_amr.amr import AMRGridFunction
+
 @partial(jax.jit, static_argnums=(1,))
 def approximate_gradient_indicator(q, bcs):
     grid = q.grid
@@ -15,6 +17,9 @@ def approximate_gradient_indicator(q, bcs):
     for dim in range(n_dims):
         vol *= L0_dx[dim]
     L0_dx_avg = vol ** (1/n_dims)
+    
+    q_max = jnp.nanmax(jnp.abs(
+        jnp.concatenate([vals.flatten() for vals in q.level_values])))
     
     def face_jump_integral(q_in, q_out, n, face_area):
         return (q_out - q_in) * face_area
@@ -43,11 +48,11 @@ def approximate_gradient_indicator(q, bcs):
         )
         
     gradient_scale_lengths = jax.tree.map(
-        lambda gq, q: jnp.abs(q) / jnp.abs(gq),
-        grad_q, q.level_values)
+        lambda gq: q_max / jnp.abs(gq),
+        grad_q)
     indicators = jax.tree.map(
         lambda gsl, d: d / gsl,
         gradient_scale_lengths, [diams[0] for diams in diameters])
         
-    return indicators
+    return AMRGridFunction(grid, indicators)
     

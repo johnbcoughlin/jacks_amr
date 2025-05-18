@@ -12,7 +12,7 @@ def refine_grid_for_function(q, bcs, indicator,
     n_levels = len(grid.levels)
     
     # Compute refinement criterion for every cell at every level
-    indicator_vals = indicator(q, bcs)
+    indicator_vals = indicator(q, bcs).level_values
     
     indicators_flat = jnp.concatenate(
         [v.flatten() for v in indicator_vals])
