@@ -72,22 +72,40 @@ class AMRLevel(eqx.Module):
     block_index_map: jax.Array
     # An n-dim tuple of 1D arrays of length n_blocks.
     block_indices: PyTree
+    active_blocks: Array
 
-    def __init__(self, block_index_map, n_active, block_indices):
+    def __init__(self, block_index_map, n_active, block_indices, active_blocks):
         self.n_active = n_active
         self.block_index_map = block_index_map
         self.block_indices = block_indices
+        self.active_blocks = active_blocks
 
 
     def with_block_active(self, block_index):
-        return jax.lax.cond(self.block_index_map[block_index] >= 0,
+        n_blocks = len(self.active_blocks)
+        new_active_idx = jnp.min(jnp.where(self.active_blocks, n_blocks+1, jnp.arange(n_blocks)))
+        new_actives = self.active_blocks.at[new_active_idx].set(True)
+        already_active = self.block_index_map[block_index] >= 0
+        return jax.lax.cond(already_active,
                             lambda: self,
                             lambda: AMRLevel(
-                                self.block_index_map.at[block_index].set(self.n_active),
+                                self.block_index_map.at[block_index].set(new_active_idx),
                                 self.n_active+1,
-                                jax.tree.map(lambda a, idx: a.at[self.n_active].set(idx),
+                                jax.tree.map(lambda a, idx: a.at[new_active_idx].set(idx),
                                              self.block_indices,
-                                             block_index)))
+                                             block_index),
+                                new_actives)), new_active_idx
+        
+    
+    def with_block_inactive(self, block_index):
+        active_idx = self.block_index_map[block_index]
+        return AMRLevel(
+            self.block_index_map.at[block_index].set(-1),
+            self.n_active-1,
+            jax.tree.map(lambda a: a.at[5].set(-1),
+                         self.block_indices),
+            self.active_blocks.at[active_idx].set(False)
+        )
 
 
 class AMRGridFactory():
@@ -159,7 +177,8 @@ class AMRGridFactory():
                                      tuple(range(self.n_dims)))
         return AMRLevel(block_index_map,
                         0,
-                        block_indices)
+                        block_indices,
+                        jnp.zeros(spec.n_blocks, bool))
 
 
     def base_grid(self):
@@ -172,7 +191,8 @@ class AMRGridFactory():
         block_indices = jax.tree.map(
                 lambda arr: arr.at[:].set(0),
                 levels[0].block_indices)
-        levels[0] = AMRLevel(block_index_map, 1, block_indices)
+        active_blocks = jnp.zeros(spec.n_blocks, bool).at[0].set(True)
+        levels[0] = AMRLevel(block_index_map, 1, block_indices, active_blocks)
         return AMRGrid(self.n_dims, levels, self.level_specs, 
             self.level_coordinates_center, self)
 
@@ -235,7 +255,7 @@ class AMRGridFactory():
                 block_indices = carry_grid.origin_to_indices(level_idx+1, fine_block_origin)
                 carry_grid = eqx.tree_at(where=lambda grid: grid.levels[level_idx+1],
                                    pytree=carry_grid,
-                                   replace_fn=lambda level: level.with_block_active(block_indices))
+                                   replace_fn=lambda level: level.with_block_active(block_indices)[0])
                 return carry_grid, None
 
             K = 10 * (2**level_idx)
@@ -338,7 +358,7 @@ class AMRGrid(eqx.Module):
         fine_block_indices = self.origin_to_indices(coarse_level_idx+1, fine_block_origin)
         n_blocks_per = jax.tree.map(
             lambda coarse_size, fine_size: (coarse_size * 2) // fine_size,
-            grid.level_specs[coarse_level_idx].block_shape, grid.level_specs[coarse_level_idx+1].block_shape)
+            self.level_specs[coarse_level_idx].block_shape, self.level_specs[coarse_level_idx+1].block_shape)
         indexer = jnp.ix_(
             *jax.tree.map(lambda o, n: o + jnp.arange(n),
                 fine_block_indices, n_blocks_per))
