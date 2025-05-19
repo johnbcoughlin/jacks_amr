@@ -20,26 +20,34 @@ def construct_example_grid():
         amr.AMRLevel(jnp.array([[0]]).T,
                      1,
                      (jnp.array([0]),
-                      jnp.array([0]))),
+                      jnp.array([0])),
+                     jnp.ones(1, bool)
+        ),
         amr.AMRLevel(jnp.array([[-1, -1],
                                 [0, -1]]).T,
                      1,
                      (jnp.array([0, -1, -1, -1]),
-                      jnp.array([1, -1, -1, -1]))),
+                      jnp.array([1, -1, -1, -1])),
+                     jnp.zeros(4, bool).at[0].set(True)
+        ),
         amr.AMRLevel(jnp.array([[-1, -1, -1, -1],
                                 [-1, -1, -1, -1],
                                 [ 0,  1, -1, -1],
                                 [-1, -1, -1, -1]]).T,
                      2,
                      (jnp.array([0, 1, -1, -1]),
-                      jnp.array([2, 2, -1, -1]))),
+                      jnp.array([2, 2, -1, -1])),
+                     jnp.zeros(4, bool).at[0:2].set(True)
+        ),
         amr.AMRLevel(jnp.array([[-1, -1, -1, -1],
                                 [-1, -1, -1, -1],
                                 [-1,  0, -1, -1],
                                 [-1, -1, -1, -1]]).T,
                      1,
                      (jnp.array([1, -1, -1, -1]),
-                      jnp.array([2, -1, -1, -1])))
+                      jnp.array([2, -1, -1, -1])),
+                      jnp.zeros(4, bool).at[0].set(True)
+                     )
     ]
 
     grid = amr.AMRGrid(2, levels, level_specs, AMR.level_coordinates_center, AMR)

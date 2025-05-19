@@ -463,6 +463,7 @@ class AMRGridFunction(eqx.Module):
             #     *neighbor_block_ghost_cell_offsets)
             neighbor_values = self.level_values[neighbor_level_idx][neighbor_block_active_idx, ...]
             neighbor_ghost_cells = neighbor_values[neighbor_block_ghost_cell_offsets]
+            neighbor_ghost_cells = jnp.reshape(neighbor_ghost_cells, ghost_cells_shape)
             result = jax.lax.cond(neighbor_block_active_idx == -1,
                                   lambda: result,
                                   lambda: neighbor_ghost_cells)

@@ -35,10 +35,14 @@ def flux_divergence(q, F_hat, bcs):
 
     div_F = [jnp.zeros_like(q.level_values[i]) for i in range(n_levels)]
     for i in range(n_levels):
+        area = 1.0
+        for dim in range(n_dims):
+            area *= grid.grid_factory.L0_dx[dim] / (2**i)
+        jax.debug.print("area: {}", area)
         div_F = eqx.tree_at(
             where=lambda t: t[i],
             pytree=div_F,
-            replace_fn=lambda t: t + flux_differences_for_divergence(final_face_fluxes[i], n_dims)
+            replace_fn=lambda t: t + flux_differences_for_divergence(final_face_fluxes[i], n_dims) / area
         )
 
     return AMRGridFunction(grid, div_F)
