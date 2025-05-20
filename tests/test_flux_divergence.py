@@ -8,6 +8,7 @@ from jacks_amr.flux_divergence import flux_divergence
 from util import construct_example_grid
 import jax.numpy as jnp
 import jax
+import equinox as eqx
 
 jax.config.update("jax_enable_x64", True)
 
@@ -15,7 +16,7 @@ def test_flux_divergence_1d():
     n_levels = 5
     L0_shape = (20,)
     level_specs = [amr.AMRLevelSpec(0, L0_shape, 1, L0_shape)] + [
-        amr.AMRLevelSpec(i, L0_shape, min(80, 9*(2**i)), (2,)) for i in range(1, 5)
+        amr.AMRLevelSpec(i, L0_shape, min(1, 9*(2**i)), (2,)) for i in range(1, 5)
     ]
     AMR = amr.AMRGridFactory(5, 1, L0_shape,
                             (0.,), (2. * jnp.pi,), level_specs)
@@ -41,6 +42,21 @@ def test_flux_divergence_1d():
     f11 = f_init(xs[11])
     right = jnp.array([1.])
     assert div_F.level_values[0][0, 10] == (flux(f10, f11, right) - flux(f9, f10, right)) / dx
+    
+    grid, _ = grid.with_block_active(1, (10,))
+    
+    f = eqx.tree_at(
+        where=lambda t: t.grid,
+        pytree=f0.with_block_refined(1, 0, (10,)),
+        replace_fn=lambda t: grid)
+    assert f.level_values[1][0, 0] == f10
+    assert f.level_values[1][0, 1] == f10
+    
+    ghost_cell = f.ghost_cells_interior(1, (20,), 0, 'left')
+    
+    div_F = flux_divergence(f, flux, copyout_bcs)
+    expected = (flux(f10, f10, right) - flux(f9, f10, right)) / (dx / 2)
+    assert div_F.level_values[1][0, 0] == (flux(f10, f10, right) - flux(f9, f10, right)) / (dx / 2)
 
 
 def test_flux_divergence_2d():
