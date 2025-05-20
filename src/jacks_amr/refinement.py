@@ -24,8 +24,6 @@ def refine_grid_for_function(q, bcs, indicator,
     cutoffs = jnp.nanquantile(indicators_sorted, cutoffs)
     refinement_cutoff = cutoffs[1]
     coarsen_cutoff = cutoffs[0]
-    jax.debug.print("refinement_cutoff: {}", refinement_cutoff)
-    jax.debug.print("coarsen_cutoff: {}", coarsen_cutoff)
     
     def should_coarsen_level(level_idx):
         below_cutoff = indicator_vals[level_idx] <= coarsen_cutoff
