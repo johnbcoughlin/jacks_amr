@@ -7,7 +7,17 @@ Prior art:
 - [jamr](https://github.com/leo1200/jamr)
 - [A gist by @patrick-kidger](https://gist.github.com/patrick-kidger/19e9c40199e5167cad1dc0e24d00855d)
 
-![docs/images/radial_tanh_amr.png]
+![Example function represented on an AMR grid](docs/images/radial_tanh_amr.png)
+
+The library currently has the following features implemented:
+- Piecewise-constant function approximation on AMR grids
+- Flux divergence calculations for finite volume discretizations of PDEs
+- An approximate-gradient refinement indicator
+- Refinement and coarsening based on a fixed fraction strategy
+
+For an actually-useful AMR library, it's clear to me that you need higher order representations of your
+solution on each cell: a discontinuous Galerkin representation, for example.
+That, as well as more sophisticated refinement indicators and strategies, are on the future roadmap.
 
 ## Design
 
