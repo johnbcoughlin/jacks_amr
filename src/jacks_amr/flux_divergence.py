@@ -38,7 +38,6 @@ def flux_divergence(q, F_hat, bcs):
         area = 1.0
         for dim in range(n_dims):
             area *= grid.grid_factory.L0_dx[dim] / (2**i)
-        jax.debug.print("area: {}", area)
         div_F = eqx.tree_at(
             where=lambda t: t[i],
             pytree=div_F,
