@@ -38,18 +38,34 @@ copyout_bcs = lambda coords, copyout_values: copyout_values
 grid = AMR.base_grid()
 f0 = grid.approximate(f_init)
 
+indicator = approximate_gradient_indicator(f0, copyout_bcs)
+
+
+# sys.exit(0)
 
 dt = 0.01
 t = 0.0
 f = f0
-T = 3.0
-while t < T:
+T = 0.4
+
+while t < 10*dt:
     div_F = flux_divergence(f, flux, copyout_bcs)
     new_values = jax.tree.map(
         lambda f, df: f - df * dt,
         f.level_values, div_F.level_values)
     f = amr.AMRGridFunction(f.grid, new_values)
-    #f = refine_grid_for_function(f, copyout_bcs, approximate_gradient_indicator)
+    if t < dt:
+        f = refine_grid_for_function(f, copyout_bcs, approximate_gradient_indicator)
+    t += dt
+    
+while t < 20*dt:
+    div_F = flux_divergence(f, flux, copyout_bcs)
+    new_values = jax.tree.map(
+        lambda f, df: f - df * dt,
+        f.level_values, div_F.level_values)
+    f = amr.AMRGridFunction(f.grid, new_values)
+    if t < 11*dt:
+        f = refine_grid_for_function(f, copyout_bcs, approximate_gradient_indicator)
     t += dt
     
 grid = f.grid
