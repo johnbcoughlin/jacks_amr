@@ -7,6 +7,14 @@ from functools import partial
 
 from jacks_amr.amr import AMRGridFunction
 
+def jump_sums_for_gradient(face_jumps, n_dims):
+    if n_dims == 1:
+        return face_jumps[0][:, 1:] + face_jumps[0][:, :-1]
+
+    if n_dims == 2:
+        return (face_jumps[0][:, 1:, :] + face_jumps[0][:, :-1, :]) + \
+            (face_jumps[1][:, :, 1:] + face_jumps[1][:, :, :-1])
+
 @partial(jax.jit, static_argnums=(1,))
 def approximate_gradient_indicator(q, bcs):
     grid = q.grid
@@ -21,8 +29,8 @@ def approximate_gradient_indicator(q, bcs):
     q_max = jnp.nanmax(jnp.abs(
         jnp.concatenate([vals.flatten() for vals in q.level_values])))
     
-    def face_jump_integral(q_in, q_out, n, face_area):
-        return (q_out - q_in) * face_area
+    def face_jump_integral(q_left, q_right, n, face_area):
+        return (q_right - q_left) * face_area
         
     face_jump_integrals = reduce_face_integrals(q, face_jump_integral, bcs)    
     
@@ -44,7 +52,7 @@ def approximate_gradient_indicator(q, bcs):
         grad_q = eqx.tree_at(
             where=lambda t: t[i],
             pytree=grad_q,
-            replace_fn=lambda t: flux_differences_for_divergence(directional_derivatives[i], n_dims)
+            replace_fn=lambda t: jump_sums_for_gradient(directional_derivatives[i], n_dims)
         )
         
     gradient_scale_lengths = jax.tree.map(

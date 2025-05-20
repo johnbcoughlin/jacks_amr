@@ -301,11 +301,9 @@ class AMRGrid(eqx.Module):
                         lambda origin, block_size, coords, axis: jnp.take(
                             coords, origin + jnp.arange(block_size), axis=axis),
                         block_origin, spec.block_shape, center_coords, one_to_ndim)
-                jax.debug.print("coords: {}", coords[0].shape)
                 return f(*coords)
 
             vmapped = jax.vmap(approximate_single_block)(level.block_indices)
-            jax.debug.print("vmapped: {}", vmapped.shape)
             new_axes = [dim+1 for dim in range(self.n_dims)]
             mask = jnp.expand_dims(level.block_indices[0] == -1, axis=new_axes)
             filtered = jnp.where(mask, jnp.nan, vmapped)
